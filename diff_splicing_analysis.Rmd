@@ -1,0 +1,480 @@
+---
+title: "Master thesis: Differential Exon Usage Analysis"
+author: "Bianka Szöllösi"
+date: "2025-03-05"
+output: html_document
+---
+This R Mardown aims to perform Differential Splicing Analysis using DEXSeq. The analysis will be performed on a dataset containing exon-level counts for different samples, along with metadata and exon annotation files.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Load libraries
+```{r libraries}
+# Load the necessary packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("DEXSeq", "BiocParallel", "SummarizedExperiment"), ask = FALSE)
+
+library(DEXSeq)
+library(BiocParallel)
+library(SummarizedExperiment)
+library(vroom)
+library(ggplot2)
+```
+
+## Parallel processing setup (for Windows)
+```{r parallel-processing}
+bp <- BiocParallel::SnowParam(4, type = "SOCK")
+```
+
+## Defining study paths
+```{r}
+# Load data for analysis
+
+# Full data 
+#count_matrix <- vroom("input_data/combined_study/count_matrix_nacc.csv", col_names = TRUE)
+#metadata <- vroom("input_data/combined_study/metadata_nacc_.csv", col_names = TRUE)
+#exon_data <- vroom("input_data/combined_study/exon_annotation_nacc.csv", col_names = TRUE)
+
+# Study 1 - RNA
+#count_matrix <- vroom("input_data/rna_study/count_matrix_nacc_rna_study.csv", col_names = TRUE)
+#metadata <- vroom("input_data/rna_study/metadata_nacc_rna_study.csv", col_names = TRUE)
+#exon_data <- vroom("input_data/combined_study/exon_annotation_nacc.csv", col_names = TRUE)
+
+# Study 2 - Diurnal
+count_matrix <- vroom("input_data/diurnal_study/count_matrix_nacc_diurnal_study.csv", col_names = TRUE)
+metadata <- vroom("input_data/diurnal_study/metadata_nacc_diurnal_study.csv", col_names = TRUE)
+exon_data <- vroom("input_data/combined_study/exon_annotation_nacc.csv", col_names = TRUE)
+
+#metadata <- as.data.frame(metadata)
+names(count_matrix)[1] <- "exon_index"
+
+```
+
+```{r}
+# Check the dataframes and their types
+str(count_matrix)
+str(metadata)
+str(exon_data)
+```
+
+```{r}
+# Prepare the count matrix excluding the first (exon_index) column:
+count_mat <- as.matrix(count_matrix[ , -1, drop=FALSE]) 
+
+## Set the row names to the first (exon_index) column:
+rownames(count_mat) <- count_matrix[[1]]
+
+## Sanity check the structure of the count matrix
+head(rownames(count_mat))
+```
+### Preparing count matrix
+```{r}
+### Filter count_matrix to exclude low-expressed exons
+
+keep <- rowSums(count_mat >= 10) >= 24   # at least 10 counts in 30% of 80 samples = 24
+count_mat_filtered <- count_mat[keep, ]
+
+#count_mat_filtered <- count_mat[rowSums(count_mat) > 50, ]
+
+# Alternative filtering: keep exons with at least 10 counts in at least half of the samples - more strict
+#min_samples <- floor(ncol(count_mat) / 2)
+#count_mat_filtered <- count_mat[rowSums(count_mat >= 10) >= min_samples, ]
+
+# Check the difference between exons included across the 2 filters
+#dropped_by_strict <- setdiff(rownames(count_mat_filtered_50), rownames(count_mat_filtered_strict))
+
+# Check the filtered count matrix
+summary(rowSums(count_mat_filtered))
+
+# Histogram of total counts per exon
+hist(rowSums(count_mat_filtered), breaks=50,
+     main="Total counts per exon after stringent filter",
+     xlab="Sum of counts across samples")
+
+```
+```{r}
+# log10 scale histogram for quick visual check of filtering
+hist(log10(rowSums(count_mat_filtered) +1), breaks=50,
+     main="Log10 total counts/exon", xlab="log10(total+1)")
+```
+```{r}
+# Convert matrix into integers before applying to DEXSeq analysis
+count_mat_filtered <- round(count_mat_filtered)
+mode(count_mat_filtered) <- "integer"
+```
+### Prepare metadata
+
+```{r}
+## Set conditions as factor, with 'normal control' as reference level
+metadata$title <- make.names(metadata$title)
+metadata$disease_state <- make.names(metadata$disease_state)
+
+char_cols <- sapply(metadata, is.character)
+if (any(char_cols)) {
+  message("Converting character columns to factors: ", paste(names(metadata)[char_cols], collapse = ", "))
+  metadata[char_cols] <- lapply(metadata[char_cols], as.factor)
+}
+metadata$disease_state = relevel(metadata$disease_state, ref = "normal.control")
+
+## Set sample_index as factor and rownames
+metadata <- as.data.frame(metadata)  # <- converts tibble to data.frame
+metadata$sample_index <- as.character(metadata$sample_index)
+rownames(metadata) <- metadata$sample_index
+
+## Subset/reorder metadata so its rows match the columns of count matrix
+metadata <- metadata[colnames(count_mat_filtered), , drop=FALSE]
+
+## Sanity check if subsetting worked properly
+stopifnot(all(rownames(metadata) == colnames(count_mat_filtered)))
+```
+### Construct GRanges from exon annotation
+```{r}
+library(GenomicRanges)
+
+# Align annotations to count_matrix rows
+exon_anno <- exon_data[ match(rownames(count_mat_filtered), exon_data$exon_index), ]
+
+# sanity check: check if count_mat and exon anno have the same row order
+stopifnot(all(rownames(count_mat_filtered) == exon_anno$exon_index))
+
+# Construct GRanges object for exon annotations
+exon_ranges <- GRanges(
+  seqnames = exon_anno$chromosome,
+  ranges = IRanges(start = exon_anno$start, end = exon_anno$exon_end),
+  strand = "*",  # because I don't have data on the strand of the exons
+  featureID = as.character(exon_anno$exon_index),
+  groupID = exon_anno$gene_name,
+  seqinfo = Seqinfo(seqnames = unique(exon_anno$chromosome), genome = "GRCh38")
+)
+
+# Match to filtered count matrix rows
+exon_ranges <- exon_ranges[match(rownames(count_mat_filtered), exon_anno$exon_index)]
+
+```
+ analysis.
+
+```{r}
+# Data used:
+#  - count_matrix_filtered: the filtered count matrix (format: exons x samples)
+#  - metadata: the sample annotation data frame
+#  - exon_data: the exon annotation data frame
+
+# Create a DEXSeqDataSet using the design formula below
+dxd <- DEXSeqDataSet(
+  countData = count_mat_filtered, 
+  sampleData = metadata,
+  #design = ~ sample_index + exon + title:exon + disease_state:exon, # full dataset
+  design = ~ sample_index + exon + disease_state:exon, # seperate studies
+  featureID = rownames(count_mat_filtered),  # the exon IDs
+  groupID = exon_anno$gene_id, #[ match(rownames(count_mat_filtered), exon_data$exon_index) ]
+  featureRanges = exon_ranges,
+  transcripts = exon_anno$transcripts 
+)
+dxd
+```
+# Sanity checks
+```{r}
+colData(dxd)
+head( counts(dxd), 5 )
+split( seq_len(ncol(dxd)), colData(dxd)$exon )
+head( featureCounts(dxd), 5 )
+head( rowRanges(dxd), 3 )
+sampleAnnotation( dxd )
+```
+
+```{r}
+# Normalization
+
+dxd = estimateSizeFactors(dxd)
+dxd = estimateDispersions(dxd)
+dxd = testForDEU(dxd, 
+        #reducedModel = ~ sample_index + exon + title:exon, # full model
+        reducedModel = ~ sample_index + exon, # seperate studies
+        BPPARAM = bp)
+
+dxd <- estimateExonFoldChanges(dxd, fitExpToVar = "disease_state")
+
+dxr = DEXSeqResults(dxd)
+
+```
+
+```{r}
+#dxr = DEXSeqResults(dxd) #, independentFiltering = FALSE) for filtering low mean normalized counts
+head(dxr)
+mcols(dxr)$description
+
+```
+Then run this again: 
+```{r}
+# How many exons are significant with false discovery rate f 10%?
+table ( dxr$padj < 0.1 )
+# How many genes are significant?
+table ( tapply( dxr$padj < 0.1, dxr$groupID, any ) )
+```
+```{r}
+# Check rows that were unable to converge
+table(rowData(dxd)$fullBetaConv)
+
+# Count FALSE (non‐converged) explicitly
+sum(rowData(dxd)$fullBetaConv == FALSE, na.rm = TRUE)
+# Count any NAs (should normally be none)
+sum(is.na(rowData(dxd)$fullBetaConv))
+```
+
+## Summarizing results
+```{r}
+# Gene-level q-values
+## Computing the Per-Gene Adjusted P-value
+qval = perGeneQValue(dxr)
+## Construct a gene-level summary data frame
+dxr.g = data.frame(gene = names(qval), qval)
+
+# Exon-level p-values
+## Extract feature (exon) level results table
+dxr.t = as.data.frame(dxr[, c("featureID","groupID","pvalue", "padj")])
+
+# Check dimensions and head of the results
+dim(dxr.g)
+head(dxr.g)
+
+dim(dxr.t)
+head(dxr.t)
+```
+```{r}	
+## 0) Load your annotation (must have: gene_id, gene_name)
+
+## Map Ensembl ID (w/o version) -> gene_name (internal only)
+sym_map <- setNames(exon_anno$gene_name, sub("\\.\\d+$", "", exon_anno$gene_id))
+
+## 1) Gene-level table with symbols
+qval  <- perGeneQValue(dxr)
+dxr.g <- data.frame(
+  gene_name = unname(sym_map[sub("\\.\\d+$","", names(qval))]),
+  gene      = names(qval),
+  qval      = as.numeric(qval),
+  stringsAsFactors = FALSE
+)
+
+## 2) Exon-level table with symbols
+dxr.t <- as.data.frame(dxr[, c("featureID","groupID","pvalue","padj")], stringsAsFactors = FALSE)
+dxr.t$gene_name <- unname(sym_map[sub("\\.\\d+$","", dxr.t$groupID)])
+
+## 3) Filter by raw p-value ≤ 0.05 (no extra ID columns created)
+dxr.t.sig <- dxr.t[!is.na(dxr.t$pvalue) & dxr.t$pvalue <= 0.05, ]
+
+## (optional) Reorder columns for readability
+dxr.g     <- dxr.g[, c("goupID", "gene_name","gene","qval")]
+dxr.t     <- dxr.t[, c("gene_name","groupID","featureID","pvalue","padj")]
+dxr.t.sig <- dxr.t.sig[, c("gene_name","groupID","featureID","pvalue","padj")]
+
+## (optional) Save
+write.csv(dxr.g,     "dexseq_genes_combined.csv", row.names = FALSE)
+write.csv(dxr.t,     "dexseq_exons_combined.csv", row.names = FALSE)
+write.csv(dxr.t.sig, "dexseq_exons_combined_pval05.csv", row.names = FALSE)
+
+```
+
+```{r}	
+
+dxr.t.sig001 <- dxr.t[!is.na(dxr.t$pvalue) & dxr.t$pvalue <= 0.001, ]
+write.csv(dxr.t.sig001, "dexseq_exons_combined_pval001.csv", row.names = FALSE)
+
+dxr.t.sig0001 <- dxr.t[!is.na(dxr.t$pvalue) & dxr.t$pvalue <= 0.0001, ]
+write.csv(dxr.t.sig0001, "dexseq_exons_combined_pval0001.csv", row.names = FALSE)
+
+dxr.t.sig00001 <- dxr.t[!is.na(dxr.t$pvalue) & dxr.t$pvalue <= 0.00001, ]
+write.csv(dxr.t.sig00001, "dexseq_exons_combined_pval00001.csv", row.names = FALSE)
+
+```
+
+```{r}	
+# Save the results to CSV files
+write.csv(as.data.frame(dxr.g), file = "DEXSeq_gene_summary_combined_study.csv")
+write.csv(as.data.frame(dxr.t), file = "DEXSeq_exon_summary_combined_study.csv")
+
+
+```
+
+```{r}
+# Checking how many genes are differentially expressed (q-value less than 0.05)
+#dim(dxr.g[dxr.g$qval < 0.05,])
+
+# Checking how many exons ahave significant change (p adj less than 0.05)
+#dim(dxr[dxr$padj < 0.05,])
+
+# Genes
+sig_genes <- sum(!is.na(dxr.g$qval) & dxr.g$qval < 0.05)
+sig_genes
+# Exons
+sig_exons <- sum(!is.na(dxr$pvalue) & dxr$pvalue < 0.05)
+sig_exons
+
+sig_exons_adjusted_05 <- sum(!is.na(dxr$padj) & dxr$padj < 0.05)
+sig_exons_adjusted_05
+
+sig_exons_adjusted_1 <- sum(!is.na(dxr$padj) & dxr$padj < 0.1)
+sig_exons_adjusted_1
+```
+
+```{r}
+# Whiche genes and exons are significant?
+sig_genes_df = dxr.g[ dxr.g$qval < 0.05, ]
+sig_exons_05_df <- as.data.frame(dxr[!is.na(dxr$padj) & dxr$padj < 0.05, ])
+sig_exons_1_df = as.data.frame(dxr[ !is.na(dxr$padj) & (dxr$padj < 0.1), ])
+
+```
+
+```{r}
+
+hist(dxr$pvalue, breaks=100, main="P-value histogram, all exons", xlab="p-value")
+```
+
+
+```{r}
+#Which gene names belong to the significant genes?
+sig_genes_df$gene_name <- exon_anno$gene_name[match(sig_genes_df$gene, exon_anno$gene_id)]
+sig_genes_df
+```
+## Visualizations
+```{r}
+# Define study name (e.g. "rna", "diurnal", "combined", etc.)
+study_name <- "diurnal"
+
+# Construct base paths
+base_results_dir <- file.path("results", study_name)
+plots_dir <- file.path(base_results_dir, "plots")
+
+# Create folders if they don't exist
+dir.create(base_results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+png(file.path(plots_dir, "dispersion_plot.png"), width = 800, height = 600)
+plotDispEsts(dxd)
+dev.off()
+```
+
+```{r}
+# MA-plot for differential exon usage
+png(file.path(plots_dir, "ma_plot.png"), width = 800, height = 600)
+plotMA(dxr, main="MA-plot for differential exon usage", cex=0.8, cex.axis=1.2, cex.lab=1.2)
+dev.off()
+
+# Histogram of adjusted p-values
+png(file.path(plots_dir, "adj_pval_hist.png"), width = 800, height = 600)
+hist(dxr$padj, breaks=100, main="Adjusted p-value histogram, all exons", xlab="Adjusted p-value")
+dev.off()
+```
+
+select genes later, when analysis is done
+```{r}
+# Before plotting, I might have to manually define fitExpToVar as disease_state
+metadata(dxr)$fitExpToVar <- "disease_state"
+
+plotDEXSeq(dxr, "AGT", DEXSeqDataSet = dxd, fitExpToVar = "disease_state", legend = TRUE, cex.axis = 1.2, cex = 1.3, lwd = 2)
+
+# Sanity check: how many exons are significant for AGT gene
+wh = (dxr$groupID=="AGT")
+stopifnot(sum(dxr$padj[wh] < formals(plotDEXSeq)$FDR)==2)
+```
+
+```{r}
+plotDEXSeq( dxr, "AGT", fitExpToVar = "disease_state", displayTranscripts=TRUE, legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2 )
+```
+
+```{r}
+plotDEXSeq( dxr, "AGT", fitExpToVar = "disease_state", expression=FALSE, norCounts=TRUE,
+   legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2 )
+```
+
+```{r}
+plotDEXSeq( dxr, "AGT", fitExpToVar = "disease_state", expression=FALSE, splicing=TRUE,
+   legend=TRUE, cex.axis=1.2, cex=1.3, lwd=2 )
+```
+
+```{r}
+
+DEXSeqHTML( dxr, FDR=0.05, fitExpToVar = "disease_state", color=c("skyblue", "pink"),  path = "DEXSeqReport/dexseq_study1_05_updated")
+```
+
+```{r}
+
+## 1) Take gene IDs from your significant exon table
+gene_ids <- unique(dxr.t.sig00001[ , "groupID"])   # or dxr.t.sig if that's your object
+
+## 2) Keep only IDs that are present in dxr (avoids empty pages)
+all_ids <- names(perGeneQValue(dxr))
+present_ids <- unique(gene_ids[gene_ids %in% all_ids])
+
+## 3) Build ID -> symbol map from your annotation
+id_map  <- unique(exon_anno[ , c("gene_id","gene_name")])
+# If your gene_id has version suffixes and dxr doesn't (or vice versa), uncomment the next two lines:
+# id_map$gene_id <- sub("\\.\\d+$", "", id_map$gene_id)
+# present_ids    <- sub("\\.\\d+$", "", present_ids)
+
+sym_map <- setNames(id_map$gene_name, id_map$gene_id)
+
+# 4) Extra column with symbols, indexed by gene ID
+# build a 1-col data.frame with a *real* name and matching rownames
+extra <- data.frame(
+  gene_names = unname(sym_map[present_ids]),
+  gene_id    = present_ids,                 # harmless extra column
+  row.names  = present_ids,
+  stringsAsFactors = FALSE,
+  check.names      = FALSE
+)
+
+DEXSeqHTML(
+  dxr,
+  genes       = present_ids,
+  fitExpToVar = "disease_state",
+  color       = c("skyblue","pink"),
+  extraCols   = extra,                      # will show "gene_names" properly
+  path        = "DEXSeqReport/custom_gene_subset"
+)
+
+
+
+```
+
+Save and export results
+```{r}
+# Save the results to CSV files
+write.csv(dxr.g, file = file.path(base_results_dir, "DEXSeq_gene_summary.csv"))
+write.csv(dxr.t, file = file.path(base_results_dir, "DEXSeq_exon_summary.csv"))
+write.csv(sig_genes_df, file = file.path(base_results_dir, "DEXSeq_sig_genes.csv"))
+write.csv(sig_exons_05_df, file = file.path(base_results_dir, "DEXSeq_sig_exons_05.csv"))
+write.csv(sig_exons_1_df, file = file.path(base_results_dir, "DEXSeq_sig_exons_1.csv"))
+
+# Save the DEXSeqDataSet and DEXSeqResults objects
+saveRDS(dxd, file = file.path(base_results_dir, "dxd.rds"))
+saveRDS(dxr, file = file.path(base_results_dir, "dxr.rds"))
+
+```
+
+# Compute per-bin across significant bins
+```{r}
+fdr_thr <- 0.05         # or 0.050 if including equals
+x <- abs(dex_results$log2fold_schizophrenia_normal.control[!is.na(dex_results$padj) &
+                                                           dex_results$padj <= fdr_thr])
+median(x); IQR(x); quantile(x, c(.25,.75))
+```
+```{r}
+#Session Info for Reproducibility
+sessionInfo()
+
+# DEXSeq version
+packageVersion("DEXSeq")
+```
+
+```{r}
+# How many exon bins are in count_mat_filtered?
+nrow(count_mat_filtered)
+
+# Take these exon id and match them to their gene names, and then count how many genes that is
+gene_names <- unique(exon_anno$gene_name[match(rownames(count_mat_filtered)])
+
+# Mean sample depth?
+mean(colSums(count_mat_filtered))
+```
