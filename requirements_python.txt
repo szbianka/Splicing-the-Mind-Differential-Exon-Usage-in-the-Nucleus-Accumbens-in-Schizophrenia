@@ -1,6 +1,6 @@
-pandas
-numpy
-pathlib
-matplotlib
+pandas == 2.3.3
+numpy == 2.3.3
+pathlib == 1.0.1
+matplotlib == 3.10.6
 opi
-rpy2
+rpy2 == 3.6.4
