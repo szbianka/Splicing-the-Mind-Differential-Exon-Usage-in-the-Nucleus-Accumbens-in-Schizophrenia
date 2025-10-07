@@ -16,10 +16,6 @@ The project bridges cognitive science and molecular psychiatry through the analy
 The study investigates whether **schizophrenia is associated with differential exon usage (DEU)** in the **nucleus accumbens (NAcc)** — a subcortical brain region central to motivation and reward processing — and evaluates the potential of **curated multi-study resources**, such as **QIAGEN’s OmicSoft DiseaseLand**, to support reproducible splicing analyses.
 
 Using the **DEXSeq** framework in R, the analysis tests for exon-level regulation differences between schizophrenia patients and healthy controls across two publicly available RNA-seq studies.  
-Results are integrated with **brain splicing QTLs (sQTLs)** and **genome-wide association study (GWAS)** data to assess genetic plausibility.
-
-Although no genome-wide significant DEU genes were detected, twelve candidate genes were identified in one dataset, several of which (**BRWD1**, **PDE2A**, **SBF2**, **CERT1**) are linked to neurodevelopmental and regulatory processes.  
-The project establishes a **transparent, reproducible workflow** for exon-level transcriptomic analysis and highlights the challenges of cross-study heterogeneity in psychiatric genomics.
 
 ---
 
@@ -39,11 +35,12 @@ The project establishes a **transparent, reproducible workflow** for exon-level 
 Install required Python packages:
 ```bash
 pip install -r requirements_python.txt
-
+```
 ### R environment
+```bash
 pkgs <- readLines("requirements_R.txt")
 install.packages(sub("==.*", "", pkgs))
-
+```
 ## Execution Notes:
 - The combined DEU analysis (two-study model) is computationally intensive and may take ~30 hours on a local machine.
 Consider using a high-performance or cloud-based environment (e.g., virtual machine or a server with ≥32 GB RAM) for faster execution.
